@@ -1,85 +1,126 @@
 /*
   ============================================================
-  SongBird for Kids - MP3 Playback Test
+  SongBird for Kids - main orchestrator
   ============================================================
-  What this sketch does, in plain English:
+  Every time the board wakes up (from deep sleep, or from a
+  fresh power-on/reset) it runs this whole sequence once, then
+  goes back to sleep until the next scheduled wake-up:
 
-    1. We already copied "10,000 Reasons - Live - Phil Wickham.mp3"
-       into the ESP32's flash memory (LittleFS) as "/song.mp3",
-       using PlatformIO's "Upload Filesystem Image" step.
-    2. This sketch hands that file to the ESP32-audioI2S library,
-       which decodes the MP3 and streams it out over the I2S pins
-       to the MAX98357A amplifier board, which drives the speaker.
+    1. Load saved settings (alarm time, loop count, volume).
+    2. Connect to Wi-Fi (or open a setup portal on first use).
+    3. Sync the clock over NTP.
+    4. Open the settings/upload web portal for a short window,
+       so a phone can change settings or upload a new song.
+    5. Save any changes made through the portal.
+    6. If the current time matches the alarm, play the song.
+    7. Work out how long until the next alarm, and deep-sleep
+       for exactly that long.
 
-  If you hear the song playing, your wiring and audio pipeline
-  are both working correctly!
+  Deep sleep restarts the chip back at setup() - there's no
+  need for anything in loop().
   ============================================================
 */
 
 #include <Arduino.h>
 #include <LittleFS.h>
-#include "Audio.h"
+#include <Preferences.h>
+#include "Config.h"
+#include "AudioModule.h"
+#include "WifiModule.h"
+#include "TimeModule.h"
+#include "WebModule.h"
 
-// ---------------------------------------------------------
-// I2S pin wiring (matches MAX98357A -> ESP32 connections)
-// ---------------------------------------------------------
-#define I2S_BCLK  14   // Bit clock
-#define I2S_LRC   25   // Left/Right (word select) clock
-#define I2S_DOUT  26   // Audio data out (ESP32 -> amplifier)
+static void playAlarmSong(const Settings& settings) {
+  AudioModule::setVolume(settings.volume);
 
-// ---------------------------------------------------------
-// Volume setting
-// ---------------------------------------------------------
-// The Audio library's volume range is 0-21.
-const uint8_t SAFE_VOLUME = 21;  // 100% (21 / 21) - larger speaker now in use
+  Serial.print("Alarm time! Playing song ");
+  Serial.print(settings.loopCount);
+  Serial.println(" time(s)...");
 
-// ---------------------------------------------------------
-// Song file settings
-// ---------------------------------------------------------
-const char* SONG_FILENAME = "/song.mp3";
-
-Audio audio;
+  for (int i = 0; i < settings.loopCount; i++) {
+    AudioModule::playSong(SONG_FILENAME);
+    while (AudioModule::isPlaying()) {
+      AudioModule::update();
+    }
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== Singing Bird - MP3 Playback Test ===");
+  Serial.println("\n=== SongBird for Kids ===");
 
-  // Start LittleFS. "true" tells it to auto-format the flash
-  // storage if it can't find a valid filesystem yet (only
-  // happens the very first time you run this).
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS mount failed!");
     return;
   }
 
-  // Tell the Audio library which pins the MAX98357A is wired to.
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-  audio.setVolume(SAFE_VOLUME);
+  Preferences prefs;
+  prefs.begin(PREFS_NAMESPACE, false);
 
-  // Start playback of the song file uploaded via "Upload Filesystem Image".
-  audio.connecttoFS(LittleFS, SONG_FILENAME);
-  Serial.println("Playing song...");
+  Settings settings;
+  settings.alarmHour   = prefs.getInt(PREFS_ALARM_HOUR, DEFAULT_ALARM_HOUR);
+  settings.alarmMinute = prefs.getInt(PREFS_ALARM_MIN, DEFAULT_ALARM_MINUTE);
+  settings.loopCount   = prefs.getInt(PREFS_LOOP_COUNT, DEFAULT_LOOP_COUNT);
+  settings.volume      = prefs.getInt(PREFS_VOLUME, DEFAULT_VOLUME);
+
+  AudioModule::begin();
+  AudioModule::setVolume(settings.volume);
+
+  bool wifiOk = WifiModule::connect();
+
+  if (wifiOk) {
+    TimeModule::sync();
+
+    WebModule::begin(settings);
+    Serial.print("WebModule: portal open for ");
+    Serial.print(WEB_PORTAL_WINDOW_SECONDS);
+    Serial.println(" seconds (use the Test Play button to check audio)...");
+    unsigned long portalStart = millis();
+    while (millis() - portalStart < WEB_PORTAL_WINDOW_SECONDS * 1000UL) {
+      AudioModule::update();
+      // Only skip the yield while a song is actively streaming - idling in a
+      // truly tight loop for up to 120 seconds starves the core's idle task
+      // and trips the Task Watchdog Timer, silently rebooting the board.
+      if (!AudioModule::isPlaying()) {
+        delay(1);
+      }
+    }
+    WebModule::end();
+
+    // Save whatever the portal left settings as - a no-op write if nothing changed.
+    prefs.putInt(PREFS_ALARM_HOUR, settings.alarmHour);
+    prefs.putInt(PREFS_ALARM_MIN, settings.alarmMinute);
+    prefs.putInt(PREFS_LOOP_COUNT, settings.loopCount);
+    prefs.putInt(PREFS_VOLUME, settings.volume);
+
+    int hour, minute;
+    if (TimeModule::getCurrentTime(hour, minute)) {
+      Serial.print("Current time: ");
+      Serial.print(hour);
+      Serial.print(":");
+      Serial.println(minute);
+
+      if (hour == settings.alarmHour && minute == settings.alarmMinute) {
+        playAlarmSong(settings);
+      }
+    }
+  } else {
+    Serial.println("No Wi-Fi this cycle - skipping time sync, portal, and alarm check.");
+  }
+
+  uint64_t sleepSeconds = TimeModule::secondsUntil(settings.alarmHour, settings.alarmMinute);
+  prefs.end();
+  WifiModule::disconnect();
+
+  Serial.print("Going to sleep for ");
+  Serial.print((unsigned long)sleepSeconds);
+  Serial.println(" seconds.");
+  Serial.flush();
+
+  ESP.deepSleep(sleepSeconds * 1000000ULL);
 }
 
 void loop() {
-  // The Audio library needs to be "fed" continuously so it can
-  // keep streaming decoded audio out over I2S. Nothing else in
-  // this sketch needs to happen in the main loop.
-  audio.loop();
-}
-
-// ---------------------------------------------------------
-// Optional status callback from the Audio library - just
-// prints what's happening so you can watch along in the
-// Serial Monitor with your daughter.
-// ---------------------------------------------------------
-void audio_info(const char *info) {
-  Serial.print("audio_info: ");
-  Serial.println(info);
-}
-
-void audio_eof_stream(const char *info) {
-  Serial.print("Done playing: ");
-  Serial.println(info);
+  // Never reached - deep sleep restarts the chip at setup().
 }
